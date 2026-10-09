@@ -1,0 +1,398 @@
+/**
+ * Copyright 2026 Salesforce, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
+ * Foundations home route overlay.
+ *
+ * A full replacement of the canonical `src/routes/_app._index.tsx` (route overlays
+ * replace, they do not merge — see docs/internal/multi-vertical/README-VITE-RESOLVER.md).
+ *
+ * Foundations follows the Figma "Storefront Home" design (node 10002:82198), which
+ * structures the page as fixed static sections with empty Page Designer slots
+ * (`🧩 Custom Region 1–7`) interspersed between them. So this overlay differs from
+ * the canonical layout in two structural ways:
+ *
+ *   1. The marketing sections (hero, featured collection, content cards, category
+ *      rail) are ALWAYS rendered as static content — not as the `errorElement`
+ *      fallback of an empty region. Adding a Page Designer component therefore
+ *      renders IN ADDITION to the static content (in the adjacent slot), rather
+ *      than replacing the whole section as the canonical/fallback pattern does.
+ *   2. Empty `<Region>` slots are placed between each section. With no components
+ *      and no `errorElement`, an empty slot renders nothing until a merchant drops
+ *      a component into it via Page Designer.
+ *
+ * Copy/typography also match Figma: "Featured Collection" (via the foundations
+ * locale override `home.featuredProducts.title`) and the H2 section-heading scale
+ * (text-4xl / font-medium / leading-none). The Newsletter band is rendered by the
+ * footer (`main-footer.tsx`, gated by `isHomepage`), not here.
+ *
+ * Fashion and cosmetic keep the canonical layout untouched.
+ */
+import { Suspense } from 'react';
+import { Await, redirect, useAsyncError } from 'react-router';
+import type { Route } from './+types/_app._index';
+import type { ShopperProducts, ShopperSearch } from '@/scapi';
+import { fetchCarouselProducts } from '@/components/product-carousel/loaders';
+import { fetchCategories } from '@/lib/api/categories.server';
+import { siteContext, resolvePrefix, type SiteContext } from '@salesforce/storefront-next-runtime/site-context';
+import { Region } from '@/components/region';
+import PopularCategories from '@/components/home/popular-categories';
+import ContentCard from '@/components/content-card';
+import { getConfig } from '@salesforce/storefront-next-runtime/config';
+import { PageType } from '@/lib/decorators/page-type';
+import { RegionDefinition } from '@/lib/decorators/region-definition';
+
+import { fetchPageWithComponentData } from '@/lib/page-designer/page-loader.server';
+import { getLogger } from '@/lib/logger.server';
+
+import hero1 from '/images/foundations/hero-carousel/hero1.webp';
+import hero2 from '/images/foundations/hero-carousel/hero2.webp';
+import hero3 from '/images/foundations/hero-carousel/hero3.webp';
+import hero4 from '/images/foundations/hero-carousel/hero4.webp';
+// New Arrivals promo banner visuals (Figma composed home node 10079:9635, Promo Banner 2):
+// minimalist geometric forms on a neutral backdrop — a trio of cubes and a single pyramid.
+// Overlaid via the foundations public dir.
+import heroNewArrivals from '/images/foundations/hero-carousel/hero-new-arrivals.webp';
+import heroPyramid from '/images/foundations/hero-carousel/hero-pyramid.webp';
+import HeroCarousel, { type HeroSlide } from '@/components/hero-carousel';
+import { ProductCarouselSkeleton } from '@/components/product-carousel';
+import { ProductCarouselWithData } from '@/components/product-carousel/carousel';
+import { SeoMeta } from '@/components/seo-meta';
+import { buildCanonicalUrl } from '@/utils/canonical-url';
+import { useTranslation } from 'react-i18next';
+import type { NormalizedApiError } from '@/lib/api/normalized-api-error';
+
+export { shouldRevalidate } from '@/lib/revalidation/routes/home';
+
+/** Figma home section-heading scale (H2): text-4xl / font-medium / leading-none, standard Tailwind tokens. */
+const featuredHeadingClassName = 'text-4xl font-medium leading-none tracking-tight text-foreground';
+
+@PageType({
+    name: 'Home Page',
+    description: 'Main landing page with static marketing sections and interspersed Page Designer slots',
+    supportedAspectTypes: [],
+})
+@RegionDefinition([
+    {
+        id: 'top',
+        name: 'Top Slot',
+        description: 'Empty slot above the hero carousel',
+        maxComponents: 3,
+    },
+    {
+        id: 'afterHero',
+        name: 'After Hero Slot',
+        description: 'Empty slot between the hero carousel and the featured collection',
+        maxComponents: 3,
+    },
+    {
+        id: 'afterFeatured',
+        name: 'After Featured Slot',
+        description: 'Empty slot between the featured collection and the content cards',
+        maxComponents: 3,
+    },
+    {
+        id: 'afterContent',
+        name: 'After Content Slot',
+        description: 'Empty slot between the content cards and the category section',
+        maxComponents: 3,
+    },
+    {
+        id: 'bottom',
+        name: 'Bottom Slot',
+        description: 'Empty slot below the category section',
+        maxComponents: 3,
+    },
+])
+export class HomePageMetadata {}
+
+function FeaturedProductsError() {
+    const error = useAsyncError() as NormalizedApiError;
+    const { t } = useTranslation('home');
+    return (
+        <div role="alert" className="py-8 text-center text-muted-foreground">
+            <p>{t('featuredProducts.loadFailed')}</p>
+            {import.meta.env.DEV && (
+                <div className="mt-2 text-xs font-mono text-muted-foreground/70">
+                    {error.status && <span>{error.status}</span>}
+                    {error.message && <p>{error.message}</p>}
+                </div>
+            )}
+        </div>
+    );
+}
+
+export type HomePageData = {
+    page: Awaited<ReturnType<typeof fetchPageWithComponentData>>;
+    searchResult: Promise<ShopperSearch.schemas['ProductSearchResult']>;
+    categories: Promise<ShopperProducts.schemas['Category'][]>;
+    pageUrl: string;
+    ogImageUrl: string;
+};
+
+/**
+ * Server-side loader function that fetches home page data.
+ * This function runs on the server during SSR and prepares data for the home page.
+ * @returns Promise that resolves to an object containing search result promise
+ */
+export async function loader(args: Route.LoaderArgs): Promise<HomePageData> {
+    const logger = getLogger(args.context);
+    logger.debug('HomePage: loader starting');
+
+    const config = getConfig(args.context);
+    const requestUrl = new URL(args.request.url);
+
+    // Redirect bare "/" to the default site/locale prefixed homepage
+    if (requestUrl.pathname === '/' && config.url?.prefix && config.url.prefix !== '/') {
+        const siteRef = config.siteAliasMap?.[config.defaultSiteId] ?? config.defaultSiteId;
+        const defaultSite = config.commerce.sites.find((s) => s.id === config.defaultSiteId);
+        const defaultLocale = defaultSite?.defaultLocale ?? config.i18n.fallbackLng;
+        const localeRef = config.localeAliasMap?.[defaultLocale] ?? defaultLocale;
+        const prefixedPath = resolvePrefix({
+            prefix: config.url.prefix,
+            params: { siteId: siteRef, localeId: localeRef },
+        });
+        throw redirect(`${prefixedPath}/`);
+    }
+
+    const currency = (args.context.get(siteContext) as SiteContext).currency;
+    const pageUrl = buildCanonicalUrl(requestUrl.origin, requestUrl.pathname, requestUrl.search);
+
+    const page = fetchPageWithComponentData(args, {
+        pageId: 'homepage',
+    });
+    const searchResult = fetchCarouselProducts(args.context, {
+        categoryId: 'root',
+        limit: config.pages.home.featuredProductsCount,
+        currency: currency ?? undefined,
+    });
+    const categories = fetchCategories(args.context, 'root', 1);
+
+    // These requests remain deferred, but must be observed if the blocking page request rejects.
+    void Promise.allSettled([searchResult, categories]);
+
+    return {
+        page: await page,
+        searchResult,
+        categories,
+        pageUrl,
+        ogImageUrl: new URL(hero1, requestUrl.origin).href,
+    };
+}
+
+/**
+ * Home page component.
+ *
+ * Renders fixed static marketing sections with empty Page Designer slots
+ * interspersed between them (see the file header for the Figma rationale).
+ * @returns JSX element representing the home page layout
+ */
+export default function HomePage({ loaderData }: { loaderData: HomePageData }) {
+    const { t } = useTranslation('home');
+
+    // The supplied hero images are ordered to match their carousel positions.
+    const heroSlides: HeroSlide[] = [
+        {
+            id: 'slide-1',
+            title: t('hero.slide1.title'),
+            subtitle: t('hero.slide1.subtitle'),
+            imageUrl: hero1,
+            imageAlt: t('hero.slide1.imageAlt'),
+            ctaText: t('hero.slide1.ctaText'),
+            ctaAriaLabel: t('hero.slide1.ctaAriaLabel'),
+            ctaLink: '/category/root',
+            overlayPosition: 'Middle Center',
+            overlayAlignment: 'center',
+        },
+        {
+            id: 'slide-2',
+            title: t('hero.slide2.title'),
+            subtitle: t('hero.slide2.subtitle'),
+            imageUrl: hero2,
+            imageAlt: t('hero.slide2.imageAlt'),
+            ctaText: t('hero.slide2.ctaText'),
+            ctaAriaLabel: t('hero.slide2.ctaAriaLabel'),
+            ctaLink: '/category/root',
+            overlayPosition: 'Middle Center',
+            overlayAlignment: 'center',
+        },
+        {
+            id: 'slide-3',
+            title: t('hero.slide3.title'),
+            subtitle: t('hero.slide3.subtitle'),
+            imageUrl: hero3,
+            imageAlt: t('hero.slide3.imageAlt'),
+            ctaText: t('hero.slide3.ctaText'),
+            ctaAriaLabel: t('hero.slide3.ctaAriaLabel'),
+            ctaLink: '/category/root',
+            overlayPosition: 'Middle Center',
+            overlayAlignment: 'center',
+        },
+        {
+            id: 'slide-4',
+            title: t('hero.slide4.title'),
+            subtitle: t('hero.slide4.subtitle'),
+            imageUrl: hero4,
+            imageAlt: t('hero.slide4.imageAlt'),
+            ctaText: t('hero.slide4.ctaText'),
+            ctaAriaLabel: t('hero.slide4.ctaAriaLabel'),
+            ctaLink: '/category/root',
+            overlayPosition: 'Middle Center',
+            overlayAlignment: 'center',
+        },
+    ];
+
+    return (
+        <div className="pb-16 -mt-8">
+            <h1 className="sr-only">{t('meta.title', { defaultValue: 'NextGen PWA Kit Store' })}</h1>
+            <SeoMeta
+                rawTitle
+                title={t('meta.title', { defaultValue: 'NextGen PWA Kit Store' })}
+                description={t('meta.description', {
+                    defaultValue: 'Welcome to our web store for high performers!',
+                })}
+                openGraph={{
+                    type: 'website',
+                    url: loaderData.pageUrl,
+                    image: loaderData.ogImageUrl,
+                }}
+            />
+
+            {/* Empty PD slot above the hero (Figma: Custom Region 1). */}
+            <Region page={loaderData.page} regionId="top" critical={true} />
+
+            {/* Hero carousel — static */}
+            <HeroCarousel
+                slides={heroSlides}
+                autoPlay={true}
+                autoPlayInterval={6000}
+                showNavigation={true}
+                showDots={true}
+            />
+
+            {/* Empty PD slot between hero and featured collection (Figma: Custom Region 2). */}
+            <Region page={loaderData.page} regionId="afterHero" />
+
+            {/* Featured Collection — static (Suspense while product data resolves) */}
+            <Suspense fallback={<ProductCarouselSkeleton title={t('featuredProducts.title')} />}>
+                <Await resolve={loaderData.searchResult} errorElement={<FeaturedProductsError />}>
+                    {(searchResult) => (
+                        <ProductCarouselWithData
+                            data={searchResult}
+                            title={t('featuredProducts.title')}
+                            titleClassName={featuredHeadingClassName}
+                            shopAllUrl="/category/root"
+                            shopAllText={t('featuredProducts.shopAll')}
+                        />
+                    )}
+                </Await>
+            </Suspense>
+
+            {/* Empty PD slot between featured collection and content cards (Figma: Custom Region 3). */}
+            <Region page={loaderData.page} regionId="afterFeatured" />
+
+            {/* Featured content cards — static. Mirrors the New Arrivals promo banner
+                below (same cube/pyramid geometric visuals and "Shop new arrivals" CTA)
+                but with the cards reversed (Pyramids then Cubes) so the two grids read
+                slightly differently. */}
+            <div className="pt-16">
+                <div className="section-container">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <ContentCard
+                            className="fnd-content-card"
+                            title={t('featuredContent.newArrivals.pyramids.title')}
+                            description={t('featuredContent.newArrivals.pyramids.description')}
+                            imageUrl={heroPyramid}
+                            imageAlt={t('featuredContent.newArrivals.pyramids.imageAlt')}
+                            buttonText={t('featuredContent.newArrivals.pyramids.ctaText')}
+                            buttonAriaLabel={t('featuredContent.newArrivals.pyramids.ctaAriaLabel')}
+                            buttonLink="/category/newarrivals"
+                            showBackground={false}
+                            showBorder={false}
+                            loading="lazy"
+                        />
+                        <ContentCard
+                            className="fnd-content-card"
+                            title={t('featuredContent.newArrivals.cubes.title')}
+                            description={t('featuredContent.newArrivals.cubes.description')}
+                            imageUrl={heroNewArrivals}
+                            imageAlt={t('featuredContent.newArrivals.cubes.imageAlt')}
+                            buttonText={t('featuredContent.newArrivals.cubes.ctaText')}
+                            buttonAriaLabel={t('featuredContent.newArrivals.cubes.ctaAriaLabel')}
+                            buttonLink="/category/newarrivals"
+                            showBackground={false}
+                            showBorder={false}
+                            loading="lazy"
+                        />
+                    </div>
+                </div>
+            </div>
+
+            {/* Empty PD slot between content cards and the category section (Figma: Custom Region 4). */}
+            <Region page={loaderData.page} regionId="afterContent" />
+
+            {/* "Style for Real Life" category rail — static (Suspense while categories resolve).
+                Center the cards when they don't fill the track (foundations opts in; the shared
+                component left-aligns by default). */}
+            <div className="pt-16">
+                <PopularCategories
+                    categoriesPromise={loaderData.categories}
+                    centerWhenPartial
+                    fallbackImageUrl={hero1}
+                />
+            </div>
+
+            {/* New Arrivals promo banner — static two-card grid (Figma composed home node
+                10079:9635, Promo Banner 2). Both cards use the grey-cube visual and link to
+                the real "newarrivals" category. Mirrors the Women/Men grid above. */}
+            <div className="pt-16">
+                <div className="section-container">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <ContentCard
+                            className="fnd-content-card"
+                            title={t('featuredContent.newArrivals.cubes.title')}
+                            description={t('featuredContent.newArrivals.cubes.description')}
+                            imageUrl={heroNewArrivals}
+                            imageAlt={t('featuredContent.newArrivals.cubes.imageAlt')}
+                            buttonText={t('featuredContent.newArrivals.cubes.ctaText')}
+                            buttonAriaLabel={t('featuredContent.newArrivals.cubes.ctaAriaLabel')}
+                            buttonLink="/category/newarrivals"
+                            showBackground={false}
+                            showBorder={false}
+                            loading="lazy"
+                        />
+                        <ContentCard
+                            className="fnd-content-card"
+                            title={t('featuredContent.newArrivals.pyramids.title')}
+                            description={t('featuredContent.newArrivals.pyramids.description')}
+                            imageUrl={heroPyramid}
+                            imageAlt={t('featuredContent.newArrivals.pyramids.imageAlt')}
+                            buttonText={t('featuredContent.newArrivals.pyramids.ctaText')}
+                            buttonAriaLabel={t('featuredContent.newArrivals.pyramids.ctaAriaLabel')}
+                            buttonLink="/category/newarrivals"
+                            showBackground={false}
+                            showBorder={false}
+                            loading="lazy"
+                        />
+                    </div>
+                </div>
+            </div>
+
+            {/* Empty PD slot below the category section (Figma: Custom Region 5). */}
+            <Region page={loaderData.page} regionId="bottom" />
+        </div>
+    );
+}
